@@ -91,7 +91,6 @@
  * allow for reads and writes of at most 32768 bytes. For more details, see
  * draft-ietf-secsh-filexfer-02.txt.
  */
-#define MAX_BUFFER_SIZE 32768
 
 static GQuark id_q;
 
@@ -206,6 +205,9 @@ struct _GVfsBackendSftp
   Connection command_connection;
   Connection data_connection;
 
+  guint32 sftp_buffer_size;
+  guint32 max_push_requests;
+  guint32 max_pull_requests;
   gboolean force_unmounted;
 };
 
@@ -318,6 +320,9 @@ expected_reply_free (ExpectedReply *reply)
 static void
 g_vfs_backend_sftp_init (GVfsBackendSftp *backend)
 {
+  backend->sftp_buffer_size = 32768;
+  backend->max_push_requests = 64;
+  backend->max_pull_requests = 64;
 }
 
 static void
@@ -488,8 +493,10 @@ setup_ssh_commandline (GVfsBackend *backend, const gchar *control_path)
 #ifndef USE_PTY
       args[last_arg++] = g_strdup ("-oBatchMode yes");
 #endif
+      args[last_arg++] = g_strdup ("-oCompression=yes");
       args[last_arg++] = g_strdup ("-oControlMaster auto");
       args[last_arg++] = g_strdup_printf ("-oControlPath=%s/%%C", control_path);
+      args[last_arg++] = g_strdup ("-oControlPersist=60s");
     }
   else if (op_backend->client_vendor == SFTP_VENDOR_SSH)
     args[last_arg++] = g_strdup ("-x");
@@ -4129,7 +4136,7 @@ try_write (GVfsBackend *backend,
   GDataOutputStream *command;
   gsize size;
 
-  size = MIN (buffer_size, MAX_BUFFER_SIZE);
+  size = MIN (buffer_size, op_backend->sftp_buffer_size);
 
   command = new_command_stream (op_backend,
                                 SSH_FXP_WRITE);
@@ -5528,8 +5535,6 @@ check_finished_or_cancelled_job (GVfsJob *job)
 /* The push sliding window mechanism is based on the one in the OpenSSH sftp
  * client. */
 
-#define PUSH_MAX_REQUESTS 64
-
 typedef struct {
   /* Job context */
   GVfsBackendSftp *backend;
@@ -5555,7 +5560,8 @@ typedef struct {
   char *tempname;
   int temp_count;
 
-  char buffer[MAX_BUFFER_SIZE];
+  char *buffer;
+  int current_max_requests; /* Current max outstanding requests for this push op */
 } SftpPushHandle;
 
 typedef struct {
@@ -5605,6 +5611,11 @@ sftp_push_handle_free (SftpPushHandle *handle)
           g_free (handle->tempname);
         }
 
+      if (handle->buffer)
+        {
+          g_slice_free1 (handle->backend->sftp_buffer_size, handle->buffer);
+          handle->buffer = NULL;
+        }
       g_object_unref (handle->backend);
       g_object_unref (handle->job);
       g_slice_free (SftpPushHandle, handle);
@@ -5619,7 +5630,7 @@ push_enqueue_request (SftpPushHandle *handle)
 {
   g_input_stream_read_async (handle->in,
                              handle->buffer,
-                             MAX_BUFFER_SIZE,
+                             handle->backend->sftp_buffer_size,
                              G_PRIORITY_DEFAULT,
                              NULL,
                              push_read_cb, handle);
@@ -5874,10 +5885,22 @@ push_write_reply (GVfsBackendSftp *backend,
           handle->n_written += count;
           g_vfs_job_progress_callback (handle->n_written, handle->size, job);
 
-          /* Enqueue a read op if the file is still open, and there isn't
-           * already one pending. */
-          if (handle->in && !g_input_stream_has_pending (handle->in))
-            push_enqueue_request (handle);
+          /* Ramp-up logic: Increment current_max_requests if not at max */
+          if (handle->current_max_requests < handle->backend->max_push_requests)
+            {
+              handle->current_max_requests++;
+            }
+
+          /* Fill the window: Enqueue new read ops if the file is still open,
+           * and we're below the current max outstanding requests.
+           */
+          while (handle->in &&
+                 !g_input_stream_has_pending (handle->in) &&
+                 handle->num_req < handle->current_max_requests &&
+                 handle->num_req < handle->backend->max_push_requests)
+            {
+              push_enqueue_request (handle);
+            }
 
           /* We are done if the file is closed and there are no write requests
            * oustanding. */
@@ -5950,9 +5973,7 @@ push_read_cb (GObject *source, GAsyncResult *res, gpointer user_data)
                                  push_write_reply,
                                  handle->job, request);
   handle->offset += count;
-
-  if (handle->num_req < PUSH_MAX_REQUESTS)
-    push_enqueue_request (handle);
+  /* Removed queueing next request from here, it's now handled by push_write_reply and push_open_reply */
 }
 
 static void push_create_temp (SftpPushHandle *handle);
@@ -6027,7 +6048,15 @@ push_create_temp_reply (GVfsBackendSftp *backend,
   else
     {
       handle->raw_handle = read_data_buffer (reply);
-      push_enqueue_request (handle);
+      /* Start with initial window size */
+      int i;
+      for (i = 0; i < handle->current_max_requests && i < handle->backend->max_push_requests; i++)
+        {
+          if (handle->in && !g_input_stream_has_pending (handle->in))
+            push_enqueue_request (handle);
+          else
+            break;
+        }
     }
 
   sftp_push_handle_free (handle);
@@ -6285,9 +6314,11 @@ try_push (GVfsBackend *backend,
     }
 
   handle = g_slice_new0 (SftpPushHandle);
+  handle->buffer = g_slice_alloc(op_backend->sftp_buffer_size);
   handle->backend = g_object_ref (op_backend);
   handle->job = g_object_ref (G_VFS_JOB (op_job));
   handle->op_job = op_job;
+  handle->current_max_requests = 1;
 
   source = g_file_new_for_path (local_path);
   g_file_query_info_async (source,
@@ -6303,7 +6334,6 @@ try_push (GVfsBackend *backend,
 /* The pull sliding window mechanism is based on the one from the OpenSSH sftp
  * client. It is complicated because requests can be returned out of order. */
 
-#define PULL_MAX_REQUESTS 64  /* Never have more than this many requests outstanding */
 #define PULL_SIZE_INCOMPLETE -1  /* Indicates an incomplete fstat() request */
 #define PULL_SIZE_INVALID -2  /* Indicates that no fstat() request is in progress */
 
@@ -6543,7 +6573,7 @@ pull_write_cb (GObject *source, GAsyncResult *res, gpointer user_data)
        * time.  Otherwise try increase the number of concurrent requests. */
       if (handle->offset > handle->size)
         handle->max_req = 1;
-      else if (handle->max_req < PULL_MAX_REQUESTS)
+      else if (handle->max_req < handle->backend->max_pull_requests)
         handle->max_req++;
 
       while (handle->num_req < handle->max_req)
@@ -6667,8 +6697,8 @@ pull_enqueue_request (SftpPullHandle *handle, guint64 offset, guint32 len)
 static void
 pull_enqueue_next_request (SftpPullHandle *handle)
 {
-  pull_enqueue_request (handle, handle->offset, MAX_BUFFER_SIZE);
-  handle->offset += MAX_BUFFER_SIZE;
+  pull_enqueue_request (handle, handle->offset, handle->backend->sftp_buffer_size);
+  handle->offset += handle->backend->sftp_buffer_size;
 }
 
 static void
