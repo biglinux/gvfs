@@ -1,0 +1,92 @@
+Part 1: SFTP Mount Option Documentation
+---------------------------------------
+
+The GVfs SFTP backend supports several mount options to fine-tune its behavior and performance. These can typically be specified when mounting a location via supported GVfs interfaces (e.g., `gio mount sftp://... -o option=value`).
+
+New Mount Options:
+
+*   `buffer_size_kb=<kilobytes>`
+    *   **Purpose**: Sets the size of the internal buffer used for individual SFTP read and write operations. Larger buffers can improve throughput on high-latency connections but may increase memory usage per transfer.
+    *   **Accepted Values**: An integer representing kilobytes. Valid range: 4 to 1024 (inclusive).
+    *   **Default**: 32 (representing 32768 bytes). Values outside the valid range will cause the default to be used.
+
+*   `max_push_requests=<count>`
+    *   **Purpose**: Sets the maximum number of concurrent SFTP write requests (for uploads). Increasing this can improve upload speeds on high-latency connections by keeping more data in flight, but setting it too high might overload the server or network.
+    *   **Accepted Values**: An integer. Valid range: 1 to 128 (inclusive).
+    *   **Default**: 64. Values outside the valid range will cause the default to be used.
+
+*   `max_pull_requests=<count>`
+    *   **Purpose**: Sets the maximum number of concurrent SFTP read requests (for downloads). Increasing this can improve download speeds on high-latency connections, similar to `max_push_requests`.
+    *   **Accepted Values**: An integer. Valid range: 1 to 128 (inclusive).
+    *   **Default**: 64. Values outside the valid range will cause the default to be used.
+
+*   `compression=yes|no`
+    *   **Purpose**: Enables or disables SSH-level compression for the SFTP connection. Compression can reduce the amount of data transferred, which is beneficial on slow links, but adds CPU overhead for both client and server.
+    *   **Accepted Values**: `yes`, `no`, `true`, `false`.
+    *   **Default**: `yes` (compression is enabled).
+
+*   `control_persist_seconds=<seconds>`
+    *   **Purpose**: Configures the SSH `ControlPersist` option when `ControlMaster` is also active (which GVfs enables by default for OpenSSH). This allows the master SSH connection to remain open in the background for the specified duration after the initial SFTP operation, speeding up subsequent connections to the same host.
+    *   **Accepted Values**: An integer.
+        *   `> 0`: The number of seconds the master connection should persist.
+        *   `0`: Disables explicit `ControlPersist` setting by GVfs (SSH client default or `ssh_config` setting for `ControlPersist` will apply, which might be `no` if not otherwise configured).
+    *   **Default**: `60` (seconds).
+
+
+Part 2: User Performance Hints for SFTP
+---------------------------------------
+
+### Optimizing SFTP Performance in GVfs
+
+While GVfs attempts to use sensible defaults, SFTP performance can be influenced by various factors, including your SSH client configuration, server configuration, and network conditions. Here are some hints for advanced users looking to tune SFTP performance:
+
+**1. Keep SSH Components Updated:**
+Ensure both your local SSH client (e.g., OpenSSH) and the SSH server are reasonably up-to-date. Newer versions often include performance improvements and more efficient cryptographic algorithms.
+
+**2. SSH Client Configuration (`~/.ssh/config`):**
+You can fine-tune SSH behavior for specific hosts or all hosts in your `~/.ssh/config` file. GVfs will use these settings when establishing the SSH connection for SFTP. Consider the following options:
+
+*   **Ciphers, MACs, and Key Exchange Algorithms:**
+    Modern SSH versions usually negotiate efficient and secure algorithms. However, on some systems or older servers, explicitly preferring faster algorithms can make a difference. For example:
+    ```
+    Host my-sftp-server.example.com
+        Ciphers aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes192-ctr,aes256-ctr
+        MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha2-256,hmac-sha2-512
+        KexAlgorithms ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256
+    ```
+    *Note: Prioritize security. Only choose algorithms supported by both client and server. `aes-gcm` ciphers are generally fast and secure.*
+
+*   **Compression:**
+    GVfs enables SSH compression by default via the `compression=yes` mount option (which translates to `-o Compression=yes`). You can disable this per-mount if desired. If you prefer to manage it globally or for specific hosts via `ssh_config`:
+    ```
+    Host my-sftp-server.example.com
+        Compression yes  # 'yes' can be good for slow links, 'no' for fast links or CPU-bound systems
+    ```
+
+*   **ControlMaster and ControlPersist:**
+    GVfs enables `ControlMaster auto` for OpenSSH by default. `ControlPersist` allows the underlying SSH connection to stay alive for a period, significantly speeding up subsequent SFTP operations (like opening multiple files or browsing directories). GVfs defaults to a 60-second persist time (configurable via the `control_persist_seconds` mount option). You can also set this in your `ssh_config`:
+    ```
+    Host *
+        ControlMaster auto
+        ControlPath ~/.ssh/controlmasters/%r@%h:%p
+        ControlPersist 60s # Time in seconds, or 'yes' for indefinite (until explicitly closed)
+    ```
+
+*   **IPQoS (IP Quality of Service):**
+    This setting can influence how network packets are prioritized. For file transfers, `throughput` might be beneficial. The default for interactive sessions is often `af21` (low-latency data) and for non-interactive (like `BatchMode yes`) it's `cs1` (low-priority).
+    ```
+    Host my-sftp-server.example.com
+        IPQoS throughput
+    ```
+    Effectiveness depends on your network and router configuration.
+
+**3. Server-Side Configuration:**
+The SSH server's configuration (e.g., in `/etc/ssh/sshd_config`) can also impact performance. This includes choices of ciphers, MACs, and potentially server-side SFTP settings (like internal buffer sizes or concurrency limits, though these are less commonly user-tunable).
+
+**4. Network Conditions:**
+Latency and bandwidth are fundamental. High latency will significantly slow down SFTP due to its request-response nature, even with high bandwidth. The concurrency options (`max_push_requests`, `max_pull_requests`) in GVfs are designed to help mitigate this by allowing more operations in flight.
+
+**5. GVfs Mount Options:**
+As detailed in the SFTP backend documentation, GVfs provides mount options like `buffer_size_kb`, `max_push_requests`, `max_pull_requests`, `compression`, and `control_persist_seconds` that allow direct tuning of some of these parameters for a specific SFTP mount. These can be used in conjunction with or to override `ssh_config` settings where applicable (e.g., GVfs directly passes compression and control persist options to the `ssh` command).
+
+Experiment with these settings carefully, as optimal values can vary greatly depending on your specific client, server, and network environment.

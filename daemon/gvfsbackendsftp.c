@@ -209,6 +209,9 @@ struct _GVfsBackendSftp
   guint32 max_push_requests;
   guint32 max_pull_requests;
   gboolean force_unmounted;
+
+  gboolean enable_compression;
+  gint control_persist_timeout; /* in seconds, -1 for default, 0 to disable */
 };
 
 static void parse_attributes (GVfsBackendSftp *backend,
@@ -323,6 +326,8 @@ g_vfs_backend_sftp_init (GVfsBackendSftp *backend)
   backend->sftp_buffer_size = 32768;
   backend->max_push_requests = 64;
   backend->max_pull_requests = 64;
+  backend->enable_compression = TRUE; /* Default to on */
+  backend->control_persist_timeout = 60; /* Default to 60s */
 }
 
 static void
@@ -493,10 +498,22 @@ setup_ssh_commandline (GVfsBackend *backend, const gchar *control_path)
 #ifndef USE_PTY
       args[last_arg++] = g_strdup ("-oBatchMode yes");
 #endif
-      args[last_arg++] = g_strdup ("-oCompression=yes");
++      if (op_backend->enable_compression)
++        {
++          args[last_arg++] = g_strdup ("-oCompression=yes");
++        }
       args[last_arg++] = g_strdup ("-oControlMaster auto");
       args[last_arg++] = g_strdup_printf ("-oControlPath=%s/%%C", control_path);
-      args[last_arg++] = g_strdup ("-oControlPersist=60s");
++      if (op_backend->control_persist_timeout > 0)
++        {
++          args[last_arg++] = g_strdup_printf ("-oControlPersist=%ds", op_backend->control_persist_timeout);
++        }
++      /* If control_persist_timeout is 0, ControlPersist is not explicitly set,
++       * allowing ssh_config's default to take effect if ControlMaster is auto.
++       * If it's -1 (our internal default before parsing), it also doesn't add the option,
++       * which means it would rely on ssh_config or ssh client defaults.
++       * The previous hardcoded 60s is now the default initialization for control_persist_timeout.
++       */
     }
   else if (op_backend->client_vendor == SFTP_VENDOR_SSH)
     args[last_arg++] = g_strdup ("-x");
@@ -2147,6 +2164,61 @@ try_mount (GVfsBackend *backend,
     {
       op_backend->user_specified = TRUE;
       op_backend->user_specified_in_uri = TRUE;
+    }
+
+  const char *value_str;
+
+  // Parse buffer_size_kb
+  value_str = g_mount_spec_get (mount_spec, "buffer_size_kb");
+  if (value_str)
+    {
+      guint32 buffer_kb = atoi (value_str);
+      if (buffer_kb >= 4 && buffer_kb <= 1024) // Min 4KB, Max 1MB (1024KB)
+        op_backend->sftp_buffer_size = buffer_kb * 1024;
+      else
+        g_warning ("Invalid buffer_size_kb value: %s. Using default %u.", value_str, op_backend->sftp_buffer_size / 1024);
+    }
+
+  // Parse max_push_requests
+  value_str = g_mount_spec_get (mount_spec, "max_push_requests");
+  if (value_str)
+    {
+      guint32 push_req = atoi (value_str);
+      if (push_req >= 1 && push_req <= 128)
+        op_backend->max_push_requests = push_req;
+      else
+        g_warning ("Invalid max_push_requests value: %s. Using default %u.", value_str, op_backend->max_push_requests);
+    }
+
+  // Parse max_pull_requests
+  value_str = g_mount_spec_get (mount_spec, "max_pull_requests");
+  if (value_str)
+    {
+      guint32 pull_req = atoi (value_str);
+      if (pull_req >= 1 && pull_req <= 128)
+        op_backend->max_pull_requests = pull_req;
+      else
+        g_warning ("Invalid max_pull_requests value: %s. Using default %u.", value_str, op_backend->max_pull_requests);
+    }
+
+  // Parse compression
+  value_str = g_mount_spec_get (mount_spec, "compression");
+  if (value_str)
+    {
+      if (g_strcmp0 (value_str, "no") == 0 || g_strcmp0 (value_str, "false") == 0)
+        op_backend->enable_compression = FALSE;
+      // else it remains TRUE (default)
+    }
+
+  // Parse control_persist_seconds
+  value_str = g_mount_spec_get (mount_spec, "control_persist_seconds");
+  if (value_str)
+    {
+      gint persist_sec = atoi (value_str);
+      if (persist_sec >= 0) // 0 means disable for ControlPersist=no, >0 for specific timeout
+        op_backend->control_persist_timeout = persist_sec;
+      else
+        g_warning ("Invalid control_persist_seconds value: %s. Using default %d.", value_str, op_backend->control_persist_timeout);
     }
       
 
