@@ -498,22 +498,22 @@ setup_ssh_commandline (GVfsBackend *backend, const gchar *control_path)
 #ifndef USE_PTY
       args[last_arg++] = g_strdup ("-oBatchMode yes");
 #endif
-+      if (op_backend->enable_compression)
-+        {
-+          args[last_arg++] = g_strdup ("-oCompression=yes");
-+        }
+      if (op_backend->enable_compression)
+        {
+          args[last_arg++] = g_strdup ("-oCompression=yes");
+        }
       args[last_arg++] = g_strdup ("-oControlMaster auto");
       args[last_arg++] = g_strdup_printf ("-oControlPath=%s/%%C", control_path);
-+      if (op_backend->control_persist_timeout > 0)
-+        {
-+          args[last_arg++] = g_strdup_printf ("-oControlPersist=%ds", op_backend->control_persist_timeout);
-+        }
-+      /* If control_persist_timeout is 0, ControlPersist is not explicitly set,
-+       * allowing ssh_config's default to take effect if ControlMaster is auto.
-+       * If it's -1 (our internal default before parsing), it also doesn't add the option,
-+       * which means it would rely on ssh_config or ssh client defaults.
-+       * The previous hardcoded 60s is now the default initialization for control_persist_timeout.
-+       */
+      if (op_backend->control_persist_timeout > 0)
+        {
+          args[last_arg++] = g_strdup_printf ("-oControlPersist=%ds", op_backend->control_persist_timeout);
+        }
+      /* If control_persist_timeout is 0, ControlPersist is not explicitly set,
+       * allowing ssh_config's default to take effect if ControlMaster is auto.
+       * If it's -1 (our internal default before parsing), it also doesn't add the option,
+       * which means it would rely on ssh_config or ssh client defaults.
+       * The previous hardcoded 60s is now the default initialization for control_persist_timeout.
+       */
     }
   else if (op_backend->client_vendor == SFTP_VENDOR_SSH)
     args[last_arg++] = g_strdup ("-x");
